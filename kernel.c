@@ -7,13 +7,8 @@
 // 링커 스크립트 심볼
 extern char __bss[], __bss_end[], __stack_top[];
 extern char __free_ram[], __free_ram_end[];
+extern char __kernel_base[];
 
-struct process {
-    int pid;             // 프로세스 ID
-    int state;           // 프로세스 상태: PROC_UNUSED 또는 PROC_RUNNABLE
-    vaddr_t sp;          // 스택 포인터
-    uint8_t stack[8192]; // 커널 스택
-};
 struct process procs[PROCS_MAX];
 struct process *proc_a;
 struct process *proc_b;
@@ -65,6 +60,25 @@ paddr_t alloc_pages(uint32_t n) {
     memset((void *) paddr, 0, n * PAGE_SIZE);
     return paddr;
 }
+
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+    if (!is_aligned(vaddr, PAGE_SIZE))
+        PANIC("unaligned vaddr %x", vaddr);
+
+    if (!is_aligned(paddr, PAGE_SIZE))
+        PANIC("unaligned paddr %x", paddr);
+
+    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
+    if ((table1[vpn1] & PAGE_V) == 0) {
+        uint32_t pt_paddr = alloc_pages(1);
+        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+    }
+
+    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
+    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+}
+
 
 __attribute__((naked)) void switch_context(uint32_t *prev_sp,
                                            uint32_t *next_sp) {
@@ -224,10 +238,16 @@ struct process *create_process(uint32_t pc) {
     *--sp = 0;                      // s0
     *--sp = (uint32_t) pc;          // ra (처음 실행 시 점프할 주소)
 
+    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+    for (paddr_t paddr = (paddr_t) __kernel_base;
+         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+    
     // 구조체 필드 초기화
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
     proc->sp = (uint32_t) sp;
+    proc->page_table = page_table;
     return proc;
 
 }
@@ -254,6 +274,18 @@ void yield(void) {
     // 컨텍스트 스위칭
     struct process *prev = current_proc;
     current_proc = next;
+
+    __asm__ __volatile__(
+        "sfence.vma\n"
+        "csrw satp, %[satp]\n"
+        "sfence.vma\n"
+        "csrw sscratch, %[sscratch]\n"
+        :
+        // 끝에 꼭 콤마가 있어야 함!
+        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
+          [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+    );
+
     switch_context(&prev->sp, &next->sp);
 }
 
